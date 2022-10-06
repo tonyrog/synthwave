@@ -1,0 +1,9 @@
+{application, synthwave,
+ [{description, "Synth Wave"},
+  {vsn, git},
+  {modules, ["@@MODULES@@"]},
+%%  {mod, {App_app, []}},
+%%  {registered, [App_srv]},
+  {env, []},
+  {applications,[kernel,stdlib,alsa,midi]}
+  ]}.
