@@ -27,14 +27,15 @@
 	 pressure = #{} :: #{ chan() => pressure() }
 	}).
 
-wdef(Note, Amp) ->
-    Freq1 = midi_play:note_to_frequency(Note),
-    Freq2 = midi_play:note_to_frequency(Note+4),
-    [{adsr, 0, 0.05, 0.05, 0.7, 0.1},
+wdef(Note, Velocity, Amp) ->
+    Freq1 = alsa_util:midi_note_to_frequency(Note),
+    Freq2 = alsa_util:midi_note_to_frequency(max(127,Note+4)),
+    V = Velocity / 254,
+    [{adsr, 0.05, 0.05, 0.4, 0.1},
      {wave, 0, [#{ form=>sine, freq=>Freq1, level=>0.0},
-		#{ form=>sine, freq=>Freq1+50, level=>0.9*Amp},
-		#{ form=>triangle, freq=>Freq1, level=>0.7*Amp},
-		#{ form=>sine, freq=>Freq1, level=>0.7*Amp},
+		#{ form=>sine, freq=>Freq1+50, level=>(V+0.5)*Amp},
+		#{ form=>triangle, freq=>Freq1, level=>0.5*Amp},
+		#{ form=>sine, freq=>Freq1, level=>0.5*Amp},
 		#{ form=>sine, freq=>Freq1-10, level=>0.0}
 	       ]},
      {wave, 1, [#{ form=>sine, freq=>Freq2, level=>0.1*Amp},
@@ -76,31 +77,39 @@ start(Name) ->
 
 start_device(InputDevice) ->
     {ok,In}  = midi:open(InputDevice,[event,list,running]),
-    Voices = lists:seq(1,?MAX_VOICES),    
+    Voices = lists:seq(1,?MAX_VOICES),
     alsa_play:start(#{ rate => 44100 }), %% latency => 50
-    Def = wdef(?C, 0),
-    alsa_play:new_wave(0, Def),  %% dummy
+    Def = wdef(?C, 1, 0),
     lists:foreach(fun(I) ->
-			  alsa_play:new_wave(I, Def),
-			  alsa_play:stop(I)
+			  alsa_play:new(I),
+			  alsa_play:stop(I),
+			  alsa_play:set_wave(I, Def)
 		  end, Voices),
-    alsa_play:run(),
     alsa_play:resume(),
     iloop(#state { midi_in=In, voices=Voices, active=#{}, pressure=#{}}).
 
+%% midi input loop
 iloop(State=#state{midi_in=In}) ->
     case midi:read(In) of
 	select ->
-	    receive
-		{select,In,undefined,ready_input} ->
-		    oloop(State)
-	    end;
+	    sloop(State);
 	{ok,N} when is_integer(N) ->
 	    oloop(State);
 	Error ->
 	    Error
     end.
 
+%% wait for select and handle notes that are done
+sloop(State=#state{midi_in=In}) ->
+    receive
+	{select,In,undefined,ready_input} ->
+	    oloop(State);
+	{_Ref,_Voice,_Pos, {off,Chan,Note}} ->
+	    State1 = off(Chan, Note, false, State),
+	    sloop(State1)
+    end.
+
+%% process midi events and generate waves
 oloop(State=#state{midi_in=In}) ->
     receive
 	{midi,In,Event} -> %% driver handle packet
@@ -110,6 +119,9 @@ oloop(State=#state{midi_in=In}) ->
 	{midi,In,Event,_Delta} -> %% driver handle packet
 	    io:format("midi event ~p\n", [Event]),
 	    State1 = midi_event(Event, State),
+	    oloop(State1);
+	{_Ref,_Voice,_Pos, {off,Chan,Note}} ->
+	    State1 = off(Chan, Note, false, State),
 	    oloop(State1)
     after 0 ->
 	    iloop(State)
@@ -127,11 +139,13 @@ midi_event(_, State) ->
 
 note_on(Chan,Note,0,State) ->
     note_off(Chan,Note,0,State);
-note_on(Chan,Note,_Velocity,State) ->
+note_on(Chan,Note,Velocity,State) ->
     case allocate_voice(State#state.voices) of
 	{V,Vs} ->
-	    %% io:format("allocate ~w to ~w\n", [V, {Chan,Note}]),
-	    alsa_play:set_wave(V, wdef(Note, 1)),
+	    io:format("~w: allocate ~w, vs:~p\n", [{Chan,Note}, V, Vs]),
+	    alsa_play:set_wave(V, wdef(Note,Velocity,1)),
+	    alsa_play:mark(V, {time,600}, [stop,once,{set,bof},notify],
+			   {off,Chan,Note}),
 	    alsa_play:restart(V),
 	    alsa_play:run(V),
 	    Active = maps:put({Chan,Note}, V, State#state.active),
@@ -140,16 +154,25 @@ note_on(Chan,Note,_Velocity,State) ->
 	    State
     end.
 
-note_off(Chan,Note,_Velocity,State) ->
+note_off(_Chan,_Note,_Velocity,State) ->
+    %% off(Chan, Node, true, State),
+    State.
+
+off(Chan,Note,Stop,State) ->
     case maps:take({Chan,Note}, State#state.active) of
-	{V, Active1} ->
-	    %% io:format("release ~w for ~w\n", [V, {Chan,Note}]),
-	    alsa_play:stop(V),
+     	{V, Active1} ->
+	    if Stop ->
+		    alsa_play:stop(V);
+	       true ->
+		    ok
+	    end,
 	    Voices = release_voice(V, State#state.voices),
+	    io:format("~w: release ~w, vs: ~p\n", [{Chan,Note},V,Voices]),
 	    State#state { voices = Voices, active = Active1 };
 	error -> 
 	    State
     end.
+    
 
 release_voice(V, Vs) ->
     [V|Vs].
